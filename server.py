@@ -646,5 +646,9 @@ async def acumatica_test_connection() -> str:
 if __name__ == "__main__":
     # Streamable HTTP transport so this can run as a remote-hosted connector
     # (e.g. on Render) that any teammate's Claude session can reach.
-    port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="streamable_http", port=port)
+    # NOTE: in this mcp SDK version (<2.0.0), host/port are set via
+    # mcp.settings, not as kwargs to run() — and the transport string uses
+    # a hyphen ("streamable-http"), not an underscore.
+    mcp.settings.host = "0.0.0.0"
+    mcp.settings.port = int(os.environ.get("PORT", 8000))
+    mcp.run(transport="streamable-http")
