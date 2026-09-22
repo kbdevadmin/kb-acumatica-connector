@@ -196,22 +196,28 @@ def _handle_api_error(e: Exception) -> str:
 
 async def _entity_get(path: str, params: Optional[dict] = None) -> Any:
     """GET against the contract-based REST entity endpoint (/entity/Default/<ver>/...)."""
-    async with await _authed_client() as client:
+    client = await _authed_client()
+    try:
         url = f"{ACUMATICA_BASE_URL}{ENTITY_BASE_PATH}/{path.lstrip('/')}"
         resp = await client.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
+    finally:
+        await client.aclose()
 
 
 async def _odata_get(path: str, params: Optional[dict] = None) -> Any:
     """GET against the OData endpoint used for GIs exposed 'via OData'."""
-    async with await _authed_client() as client:
+    client = await _authed_client()
+    try:
         url = f"{ACUMATICA_BASE_URL}{ODATA_BASE_PATH}/{path.lstrip('/')}"
         resp = await client.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         # OData JSON responses often wrap results in a "value" array.
         data = resp.json()
         return data
+    finally:
+        await client.aclose()
 
 
 def _company_qs() -> dict:
@@ -630,10 +636,13 @@ async def acumatica_test_connection() -> str:
     if err:
         return err
     try:
-        async with await _authed_client() as client:
+        client = await _authed_client()
+        try:
             url = f"{ACUMATICA_BASE_URL}{ENTITY_BASE_PATH}/Customer"
             resp = await client.get(url, params={"$top": 1}, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
+        finally:
+            await client.aclose()
         return (
             f"OK: authenticated successfully to {ACUMATICA_BASE_URL} "
             f"(API version {ACUMATICA_API_VERSION}, company "
