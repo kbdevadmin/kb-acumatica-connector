@@ -77,10 +77,13 @@ ACUMATICA_API_VERSION = os.environ.get("ACUMATICA_API_VERSION", "24.200.001")
 # endpoint, not /entity/. The exact path has historically been one of:
 #   /odata/<Company>/<InquiryName>
 #   /entity/OData/<InquiryName>
-# Kept configurable since it varies by Acumatica version — verify with
-# acumatica_discover_odata_entities() once credentials are live, and update
-# this env var / default if needed.
-ODATA_BASE_PATH = os.environ.get("ACUMATICA_ODATA_BASE_PATH", "/odata")
+# Kept configurable since it varies by Acumatica version/instance. Confirmed
+# live on 2026-09-22 via acumatica_discover_odata_entities: this instance's
+# OData service root requires the company name in the path (classic/v3-style
+# OData), not bare "/odata" — the bare path 404s at the service-root level.
+ODATA_BASE_PATH = os.environ.get(
+    "ACUMATICA_ODATA_BASE_PATH", "/odata/Kondor%20Blue%20-%20Production"
+)
 
 TOKEN_URL_PATH = "/identity/connect/token"
 ENTITY_BASE_PATH = f"/entity/Default/{ACUMATICA_API_VERSION}"
@@ -409,7 +412,13 @@ async def acumatica_get_backorder_dollar_units(params: BackorderDollarUnitsInput
         params_qs: dict = {"$top": params.top}
         if params.filter_odata:
             params_qs["$filter"] = params.filter_odata
-        payload = await _odata_get("BackorderDollar&Units", params=params_qs)
+        # NOTE: the GI's on-screen title is "BackorderDollar&Units", but
+        # Acumatica strips special characters from the published OData
+        # resource name — confirmed via acumatica_discover_odata_entities
+        # on 2026-09-22 that the real name is "BackorderDollarUnits" (no
+        # ampersand). Using the wrong (title-cased-with-&) name causes a
+        # 302 redirect to /Frames/Error.aspx rather than a clean 404.
+        payload = await _odata_get("BackorderDollarUnits", params=params_qs)
         rows = _rows_from_odata_payload(payload)
         if params.response_format == ResponseFormat.MARKDOWN:
             return _to_markdown_table(rows)
