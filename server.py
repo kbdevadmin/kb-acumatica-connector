@@ -651,4 +651,20 @@ if __name__ == "__main__":
     # a hyphen ("streamable-http"), not an underscore.
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = int(os.environ.get("PORT", 8000))
+
+    # The mcp SDK auto-enables Host-header ("DNS rebinding") protection when
+    # it detects a localhost bind at FastMCP() construction time (before we
+    # set the real host above), and locks its allowed_hosts to
+    # 127.0.0.1/localhost only. On a hosted platform like Render, the real
+    # incoming Host header is the public domain, so that check then rejects
+    # every request with "Invalid Host header" (HTTP 421). This server has
+    # no browser-facing session/cookie state for DNS rebinding to exploit
+    # (all Acumatica auth happens server-side via env vars), so it's safe to
+    # simply disable this protection here rather than hardcode a domain.
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    )
+
     mcp.run(transport="streamable-http")
