@@ -609,6 +609,44 @@ async def acumatica_query_odata_inquiry(params: RawODataQueryInput) -> str:
 
 
 @mcp.tool(
+    name="acumatica_discover_odata_entities",
+    annotations={
+        "title": "List OData Endpoint Names Exposed by This Acumatica Instance",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def acumatica_discover_odata_entities() -> str:
+    """Fetch the OData service document root (no entity name appended) and
+    return the list of exposed entity/EntitySet names. Use this to find the
+    exact published name for a Generic Inquiry exposed 'via OData' when the
+    on-screen title (e.g. 'BackorderDollar&Units') doesn't match what the
+    service actually publishes — Acumatica often sanitizes special
+    characters like '&' out of the published OData name.
+
+    Returns:
+        str: raw JSON/XML service document text (truncated to ~4000 chars)
+        on success, or "Error: ..." with the HTTP status and a body snippet
+        if the base OData path itself is wrong for this instance.
+    """
+    err = _require_config()
+    if err:
+        return err
+    client = await _authed_client()
+    try:
+        url = f"{ACUMATICA_BASE_URL}{ODATA_BASE_PATH}"
+        resp = await client.get(url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return resp.text[:4000]
+    except Exception as e:  # noqa: BLE001
+        return _handle_api_error(e)
+    finally:
+        await client.aclose()
+
+
+@mcp.tool(
     name="acumatica_test_connection",
     annotations={
         "title": "Test Acumatica Connection & Auth",
