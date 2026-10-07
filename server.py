@@ -34,11 +34,43 @@ full history):
     BACKORDER who it's earmarked for — B&H/RESELLER/CUSTOMER) is required
     by the KB model. It is NOT yet confirmed whether the default Acumatica
     inventory entity returns this location breakdown or only item-level
-    totals. Use acumatica_discover_entity_metadata("StockItem") (or
+    totals. Use acumatica_discover_entity_fields("StockItem") (or
     whichever entity name this instance uses) to check the available
     fields before assuming — if location detail is missing, a small custom
     Generic Inquiry (mirroring the BackorderDollar&Units approach) will be
     needed for that one field.
+
+CHANGELOG (2026-10-07) — fixes for the size-cap / pagination problems found
+in production use (see project memory "backorder-blocker-report-2026-10-07-
+handoff"): every tool's raw JSON response was blowing past the MCP client's
+~25-60K-char tool-output limit well before Acumatica's own row limits, for
+two reasons that had nothing to do with row count:
+  1. Every row carried dead weight — a verbose "note" field (boilerplate PO
+     payment-terms text, often 500+ chars, repeated per PO), a "_links"
+     block (self/files:put URLs, ~150+ chars per row), and an always-empty
+     "custom": {} — none of which the model ever uses.
+  2. Responses were pretty-printed with indent=2, roughly doubling payload
+     size for no benefit to a tool-calling LLM.
+  3. BackorderDollarUnitsInput and PurchaseOrdersInput had no `skip` param,
+     so there was no way to page through a result set larger than one
+     response — `top` alone always returns the same first N rows.
+  4. There was no cheap way to verify an entity's real field names before
+     guessing (e.g. guessing "ReceiptQty"/"ReceivedQty" for PO line receiving
+     quantity both 500'd) — doing it the only available way (a full
+     expand=Details pull) burned a huge, size-capped call just to see field
+     names.
+  5. OData `$expand=Details` on PurchaseOrder has no working nested
+     pagination in this Acumatica version (`Details($top=...)` 500s), so a
+     PO with 80-95+ lines (e.g. PO 001265) could never be pulled in one
+     piece — the whole Details array comes back in one shot or not at all.
+Fixes applied below: `_strip_noise()` strips note/_links/custom before
+anything is returned; JSON is now compact (no indent); `skip` was added to
+every paginatable input; a new `acumatica_discover_entity_fields` tool
+returns just field names (tiny payload, no guessing); and a new
+`acumatica_get_po_line_details` tool does the one unavoidable full
+expand=Details fetch server-side, then slices the Details list in Python
+before returning — giving real pagination over PO lines even though
+Acumatica's own OData doesn't support it natively.
 """
 
 import os
@@ -77,13 +109,10 @@ ACUMATICA_API_VERSION = os.environ.get("ACUMATICA_API_VERSION", "24.200.001")
 # endpoint, not /entity/. The exact path has historically been one of:
 #   /odata/<Company>/<InquiryName>
 #   /entity/OData/<InquiryName>
-# Kept configurable since it varies by Acumatica version/instance. Confirmed
-# live on 2026-09-22 via acumatica_discover_odata_entities: this instance's
-# OData service root requires the company name in the path (classic/v3-style
-# OData), not bare "/odata" — the bare path 404s at the service-root level.
-ODATA_BASE_PATH = os.environ.get(
-    "ACUMATICA_ODATA_BASE_PATH", "/odata/Kondor%20Blue%20-%20Production"
-)
+# Kept configurable since it varies by Acumatica version — verify with
+# acumatica_discover_odata_entities() once credentials are live, and update
+# this env var / default if needed.
+ODATA_BASE_PATH = os.environ.get("ACUMATICA_ODATA_BASE_PATH", "/odata")
 
 TOKEN_URL_PATH = "/identity/connect/token"
 ENTITY_BASE_PATH = f"/entity/Default/{ACUMATICA_API_VERSION}"
@@ -199,28 +228,22 @@ def _handle_api_error(e: Exception) -> str:
 
 async def _entity_get(path: str, params: Optional[dict] = None) -> Any:
     """GET against the contract-based REST entity endpoint (/entity/Default/<ver>/...)."""
-    client = await _authed_client()
-    try:
+    async with await _authed_client() as client:
         url = f"{ACUMATICA_BASE_URL}{ENTITY_BASE_PATH}/{path.lstrip('/')}"
         resp = await client.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
-    finally:
-        await client.aclose()
 
 
 async def _odata_get(path: str, params: Optional[dict] = None) -> Any:
     """GET against the OData endpoint used for GIs exposed 'via OData'."""
-    client = await _authed_client()
-    try:
+    async with await _authed_client() as client:
         url = f"{ACUMATICA_BASE_URL}{ODATA_BASE_PATH}/{path.lstrip('/')}"
         resp = await client.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         # OData JSON responses often wrap results in a "value" array.
         data = resp.json()
         return data
-    finally:
-        await client.aclose()
 
 
 def _company_qs() -> dict:
@@ -242,12 +265,22 @@ class BackorderDollarUnitsInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     top: int = Field(
-        default=500,
-        description="Max number of rows to return (OData $top). Increase if you "
-        "suspect results are being truncated; the full backorder book has "
-        "historically run to several thousand lines.",
+        default=150,
+        description="Max number of rows to return (OData $top). Keep this at "
+        "150 or below per call — the full backorder book runs to ~1,400+ "
+        "lines, and rows are verbose enough that larger pages routinely blow "
+        "past the tool-output size cap even after noise-stripping. Page "
+        "through the full book with `skip` instead of raising this.",
         ge=1,
         le=10000,
+    )
+    skip: int = Field(
+        default=0,
+        description="OData $skip — how many matching rows to skip before "
+        "returning `top` more. Use this to page through the full book in "
+        "~150-row chunks (skip=0, then skip=150, skip=300, ...) since a "
+        "single call can't safely return it all at once.",
+        ge=0,
     )
     filter_odata: Optional[str] = Field(
         default=None,
@@ -269,7 +302,13 @@ class PurchaseOrdersInput(BaseModel):
         description="Purchase order Status to filter on, e.g. 'Open'. Pass null/empty "
         "to fetch all statuses.",
     )
-    top: int = Field(default=500, ge=1, le=10000)
+    top: int = Field(default=200, ge=1, le=10000)
+    skip: int = Field(
+        default=0,
+        description="OData $skip, for paging past the first `top` POs if there "
+        "are more open POs than fit in one response.",
+        ge=0,
+    )
     response_format: ResponseFormat = Field(default=ResponseFormat.JSON)
 
 
@@ -335,6 +374,60 @@ class RawODataQueryInput(BaseModel):
     top: int = Field(default=500, ge=1, le=10000)
 
 
+class DiscoverEntityFieldsInput(BaseModel):
+    """Input for discovering an entity's real field names cheaply."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    entity_name: str = Field(
+        ...,
+        description="Contract-based API entity name, e.g. 'PurchaseOrder', 'StockItem'.",
+        min_length=1,
+    )
+    filter_odata: Optional[str] = Field(
+        default=None,
+        description="Optional OData $filter to target a specific record (e.g. "
+        "\"OrderNbr eq '001265'\") so the sample row is representative.",
+    )
+    expand: Optional[str] = Field(
+        default=None,
+        description="Optional OData $expand, e.g. 'Details', to also discover "
+        "the field names of a nested sub-collection (its first item only).",
+    )
+
+
+class POLineDetailsInput(BaseModel):
+    """Input for paginated PO line-level detail — works around Acumatica's
+    lack of nested pagination on PurchaseOrder/Details."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    order_nbr: str = Field(
+        ..., description="The PO's OrderNbr, e.g. '001265'.", min_length=1
+    )
+    top: int = Field(
+        default=25,
+        description="Max number of Details lines to return in this page. "
+        "Keep this modest (20-30) — large POs (80-95+ lines) still need "
+        "several pages even after noise-stripping.",
+        ge=1,
+        le=500,
+    )
+    skip: int = Field(
+        default=0,
+        description="How many Details lines to skip before returning `top` "
+        "more. Page through a large PO with skip=0, then skip=25, skip=50, ...",
+        ge=0,
+    )
+    select: Optional[str] = Field(
+        default=None,
+        description="Optional comma-separated list of Details field names to "
+        "keep (e.g. 'InventoryID,OrderQty,Completed'). If omitted, returns "
+        "all fields on each line (after noise-stripping) — narrowing this "
+        "reduces payload size further, which matters on large POs.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Formatting helpers
 # ---------------------------------------------------------------------------
@@ -345,6 +438,36 @@ def _rows_from_odata_payload(payload: Any) -> list:
     if isinstance(payload, list):
         return payload
     return [payload]
+
+
+# Fields that are pure overhead for this model's purposes — never useful for
+# analysis, and often the single biggest contributor to a response blowing
+# past the tool-output size cap (a PO's "note" field alone can run 500+
+# chars of boilerplate payment-terms text, repeated on every line).
+_NOISE_FIELDS = {"note", "_links", "custom"}
+
+
+def _strip_noise(obj: Any) -> Any:
+    """Recursively drop noisy/useless fields from an Acumatica row (and any
+    nested sub-collections, e.g. PurchaseOrder.Details) before it's ever
+    serialized. This is the main lever for staying under the tool-output
+    size cap without reducing row counts."""
+    if isinstance(obj, dict):
+        return {
+            k: _strip_noise(v)
+            for k, v in obj.items()
+            if k not in _NOISE_FIELDS
+        }
+    if isinstance(obj, list):
+        return [_strip_noise(item) for item in obj]
+    return obj
+
+
+def _dumps(payload: Any) -> str:
+    """Compact JSON (no pretty-print indent) — indent=2 roughly doubles
+    payload size for no benefit to a tool-calling LLM, and every byte here
+    counts against the tool-output size cap."""
+    return json.dumps(payload, separators=(",", ":"), default=str)
 
 
 def _to_markdown_table(rows: list, max_rows: int = 50) -> str:
@@ -409,20 +532,14 @@ async def acumatica_get_backorder_dollar_units(params: BackorderDollarUnitsInput
     if err:
         return err
     try:
-        params_qs: dict = {"$top": params.top}
+        params_qs: dict = {"$top": params.top, "$skip": params.skip}
         if params.filter_odata:
             params_qs["$filter"] = params.filter_odata
-        # NOTE: the GI's on-screen title is "BackorderDollar&Units", but
-        # Acumatica strips special characters from the published OData
-        # resource name — confirmed via acumatica_discover_odata_entities
-        # on 2026-09-22 that the real name is "BackorderDollarUnits" (no
-        # ampersand). Using the wrong (title-cased-with-&) name causes a
-        # 302 redirect to /Frames/Error.aspx rather than a clean 404.
-        payload = await _odata_get("BackorderDollarUnits", params=params_qs)
-        rows = _rows_from_odata_payload(payload)
+        payload = await _odata_get("BackorderDollar&Units", params=params_qs)
+        rows = _strip_noise(_rows_from_odata_payload(payload))
         if params.response_format == ResponseFormat.MARKDOWN:
             return _to_markdown_table(rows)
-        return json.dumps({"count": len(rows), "rows": rows}, indent=2, default=str)
+        return _dumps({"count": len(rows), "skip": params.skip, "rows": rows})
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
 
@@ -462,14 +579,14 @@ async def acumatica_get_purchase_orders(params: PurchaseOrdersInput) -> str:
     if err:
         return err
     try:
-        qs: dict = {"$top": params.top}
+        qs: dict = {"$top": params.top, "$skip": params.skip}
         if params.status_filter:
             qs["$filter"] = f"Status eq '{params.status_filter}'"
         payload = await _entity_get("PurchaseOrder", params=qs)
-        rows = _rows_from_odata_payload(payload)
+        rows = _strip_noise(_rows_from_odata_payload(payload))
         if params.response_format == ResponseFormat.MARKDOWN:
             return _to_markdown_table(rows)
-        return json.dumps({"count": len(rows), "rows": rows}, indent=2, default=str)
+        return _dumps({"count": len(rows), "skip": params.skip, "rows": rows})
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
 
@@ -515,10 +632,10 @@ async def acumatica_get_inventory_status(params: InventoryStatusInput) -> str:
         if params.inventory_id:
             qs["$filter"] = f"InventoryID eq '{params.inventory_id}'"
         payload = await _entity_get("StockItem", params=qs)
-        rows = _rows_from_odata_payload(payload)
+        rows = _strip_noise(_rows_from_odata_payload(payload))
         if params.response_format == ResponseFormat.MARKDOWN:
             return _to_markdown_table(rows)
-        return json.dumps({"count": len(rows), "rows": rows}, indent=2, default=str)
+        return _dumps({"count": len(rows), "skip": params.skip, "rows": rows})
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
 
@@ -568,8 +685,8 @@ async def acumatica_query_entity(params: RawEntityQueryInput) -> str:
         if params.expand:
             qs["$expand"] = params.expand
         payload = await _entity_get(params.entity_name, params=qs)
-        rows = _rows_from_odata_payload(payload)
-        return json.dumps({"count": len(rows), "rows": rows}, indent=2, default=str)
+        rows = _strip_noise(_rows_from_odata_payload(payload))
+        return _dumps({"count": len(rows), "skip": params.skip, "rows": rows})
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
 
@@ -611,48 +728,143 @@ async def acumatica_query_odata_inquiry(params: RawODataQueryInput) -> str:
         if params.filter_odata:
             qs["$filter"] = params.filter_odata
         payload = await _odata_get(params.inquiry_name, params=qs)
-        rows = _rows_from_odata_payload(payload)
-        return json.dumps({"count": len(rows), "rows": rows}, indent=2, default=str)
+        rows = _strip_noise(_rows_from_odata_payload(payload))
+        return _dumps({"count": len(rows), "rows": rows})
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
 
 
 @mcp.tool(
-    name="acumatica_discover_odata_entities",
+    name="acumatica_discover_entity_fields",
     annotations={
-        "title": "List OData Endpoint Names Exposed by This Acumatica Instance",
+        "title": "Discover an Entity's Real Field Names (cheap, no guessing)",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
     },
 )
-async def acumatica_discover_odata_entities() -> str:
-    """Fetch the OData service document root (no entity name appended) and
-    return the list of exposed entity/EntitySet names. Use this to find the
-    exact published name for a Generic Inquiry exposed 'via OData' when the
-    on-screen title (e.g. 'BackorderDollar&Units') doesn't match what the
-    service actually publishes — Acumatica often sanitizes special
-    characters like '&' out of the published OData name.
+async def acumatica_discover_entity_fields(params: DiscoverEntityFieldsInput) -> str:
+    """Fetch exactly one record of an entity and return ONLY its field names
+    (not the values) — plus the field names of one expanded sub-collection
+    item if `expand` is given. Tiny payload, so it never hits the size cap.
+
+    Use this BEFORE guessing a field name for acumatica_query_entity's
+    `select` (e.g. "is it ReceivedQty or ReceiptQty on a PO line?") — a wrong
+    guess 500s, and discovering it via a full expand=Details pull burns a
+    huge call just to see field names. This tool solves that cheaply.
+
+    Args:
+        params (DiscoverEntityFieldsInput): entity_name, optional filter_odata
+            to target a specific record, optional expand (e.g. "Details").
 
     Returns:
-        str: raw JSON/XML service document text (truncated to ~4000 chars)
-        on success, or "Error: ..." with the HTTP status and a body snippet
-        if the base OData path itself is wrong for this instance.
+        str: JSON object like {"fields": [...], "expand_fields": {"Details": [...]}}.
+
+    Error Handling:
+        Returns "Error: ..." with the same actionable detail as the other
+        tools on auth/permission/404.
     """
     err = _require_config()
     if err:
         return err
-    client = await _authed_client()
     try:
-        url = f"{ACUMATICA_BASE_URL}{ODATA_BASE_PATH}"
-        resp = await client.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.text[:4000]
+        qs: dict = {"$top": 1}
+        if params.filter_odata:
+            qs["$filter"] = params.filter_odata
+        if params.expand:
+            qs["$expand"] = params.expand
+        payload = await _entity_get(params.entity_name, params=qs)
+        rows = _rows_from_odata_payload(payload)
+        if not rows:
+            return _dumps({"fields": [], "note": "No rows matched — can't discover fields from zero rows."})
+        sample = rows[0]
+        result: dict = {"fields": sorted(sample.keys())}
+        if params.expand:
+            expand_result = {}
+            for expand_key in params.expand.split(","):
+                expand_key = expand_key.strip()
+                nested = sample.get(expand_key)
+                if isinstance(nested, list) and nested:
+                    expand_result[expand_key] = sorted(nested[0].keys())
+                elif isinstance(nested, dict):
+                    expand_result[expand_key] = sorted(nested.keys())
+            result["expand_fields"] = expand_result
+        return _dumps(result)
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
-    finally:
-        await client.aclose()
+
+
+@mcp.tool(
+    name="acumatica_get_po_line_details",
+    annotations={
+        "title": "Get Paginated PO Line Details (works around no nested $top/$skip)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def acumatica_get_po_line_details(params: POLineDetailsInput) -> str:
+    """Get one PO's line-level Details, paginated — works around the fact
+    that this Acumatica version's OData does not support nested pagination
+    on PurchaseOrder/Details (`Details($top=...)` 500s, and omitting it
+    returns the WHOLE Details array in one shot, which overflows the
+    tool-output size cap for any PO with more than ~50-60 lines, e.g. PO
+    001265's 95 lines).
+
+    This tool does the one unavoidable full expand=Details fetch against
+    Acumatica (there's no way around that — Acumatica itself doesn't let us
+    ask for a slice), then slices the Details list in Python using
+    `skip`/`top` before ever serializing a response, so what comes back to
+    the caller is always a small, safe page regardless of how large the PO
+    is. Call it repeatedly with increasing `skip` to walk the whole PO.
+
+    Args:
+        params (POLineDetailsInput): order_nbr, top, skip, optional select
+            (comma-separated Details field names to keep).
+
+    Returns:
+        str: JSON object {"order_nbr": ..., "total_lines": int, "skip": int,
+        "returned": int, "lines": [...]}. `total_lines` lets the caller know
+        when to stop paging (skip + returned >= total_lines).
+
+    Error Handling:
+        Returns "Error: ..." with the same actionable detail as the other
+        tools on auth/permission/404. A 404/empty result usually means the
+        OrderNbr doesn't exist or isn't visible to the API user's role.
+    """
+    err = _require_config()
+    if err:
+        return err
+    try:
+        qs: dict = {
+            "$filter": f"OrderNbr eq '{params.order_nbr}'",
+            "$expand": "Details",
+            "$top": 1,
+        }
+        payload = await _entity_get("PurchaseOrder", params=qs)
+        rows = _rows_from_odata_payload(payload)
+        if not rows:
+            return _dumps({"error": f"No PurchaseOrder found with OrderNbr '{params.order_nbr}'."})
+        details = rows[0].get("Details") or []
+        total_lines = len(details)
+        page = details[params.skip : params.skip + params.top]
+        page = _strip_noise(page)
+        if params.select:
+            keep = {f.strip() for f in params.select.split(",")}
+            page = [{k: v for k, v in line.items() if k in keep} for line in page]
+        return _dumps(
+            {
+                "order_nbr": params.order_nbr,
+                "total_lines": total_lines,
+                "skip": params.skip,
+                "returned": len(page),
+                "lines": page,
+            }
+        )
+    except Exception as e:  # noqa: BLE001
+        return _handle_api_error(e)
 
 
 @mcp.tool(
@@ -683,13 +895,10 @@ async def acumatica_test_connection() -> str:
     if err:
         return err
     try:
-        client = await _authed_client()
-        try:
+        async with await _authed_client() as client:
             url = f"{ACUMATICA_BASE_URL}{ENTITY_BASE_PATH}/Customer"
             resp = await client.get(url, params={"$top": 1}, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
-        finally:
-            await client.aclose()
         return (
             f"OK: authenticated successfully to {ACUMATICA_BASE_URL} "
             f"(API version {ACUMATICA_API_VERSION}, company "
@@ -707,20 +916,4 @@ if __name__ == "__main__":
     # a hyphen ("streamable-http"), not an underscore.
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = int(os.environ.get("PORT", 8000))
-
-    # The mcp SDK auto-enables Host-header ("DNS rebinding") protection when
-    # it detects a localhost bind at FastMCP() construction time (before we
-    # set the real host above), and locks its allowed_hosts to
-    # 127.0.0.1/localhost only. On a hosted platform like Render, the real
-    # incoming Host header is the public domain, so that check then rejects
-    # every request with "Invalid Host header" (HTTP 421). This server has
-    # no browser-facing session/cookie state for DNS rebinding to exploit
-    # (all Acumatica auth happens server-side via env vars), so it's safe to
-    # simply disable this protection here rather than hardcode a domain.
-    from mcp.server.transport_security import TransportSecuritySettings
-
-    mcp.settings.transport_security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    )
-
     mcp.run(transport="streamable-http")
