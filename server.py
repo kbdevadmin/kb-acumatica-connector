@@ -83,6 +83,7 @@ from enum import Enum
 import httpx
 from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("acumatica_mcp")
@@ -227,23 +228,39 @@ def _handle_api_error(e: Exception) -> str:
 # ---------------------------------------------------------------------------
 
 async def _entity_get(path: str, params: Optional[dict] = None) -> Any:
-    """GET against the contract-based REST entity endpoint (/entity/Default/<ver>/...)."""
-    async with await _authed_client() as client:
+    """GET against the contract-based REST entity endpoint (/entity/Default/<ver>/...).
+
+    NOTE: deliberately not `async with await _authed_client() as client:` —
+    _authed_client()'s first request (fetching the token) already flips
+    httpx's internal client state to OPENED before this function ever sees
+    it, so a second `__aenter__` via `async with` 500s with "Cannot open a
+    client instance more than once." (fixed once already, 2026-09-22 commit
+    559a2d4 — regressed when this file was edited from a stale local copy on
+    2026-10-07, now fixed again here).
+    """
+    client = await _authed_client()
+    try:
         url = f"{ACUMATICA_BASE_URL}{ENTITY_BASE_PATH}/{path.lstrip('/')}"
         resp = await client.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
+    finally:
+        await client.aclose()
 
 
 async def _odata_get(path: str, params: Optional[dict] = None) -> Any:
-    """GET against the OData endpoint used for GIs exposed 'via OData'."""
-    async with await _authed_client() as client:
+    """GET against the OData endpoint used for GIs exposed 'via OData'.
+    See the note on `_entity_get` re: why this doesn't use `async with`.
+    """
+    client = await _authed_client()
+    try:
         url = f"{ACUMATICA_BASE_URL}{ODATA_BASE_PATH}/{path.lstrip('/')}"
         resp = await client.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         # OData JSON responses often wrap results in a "value" array.
-        data = resp.json()
-        return data
+        return resp.json()
+    finally:
+        await client.aclose()
 
 
 def _company_qs() -> dict:
@@ -895,10 +912,13 @@ async def acumatica_test_connection() -> str:
     if err:
         return err
     try:
-        async with await _authed_client() as client:
+        client = await _authed_client()
+        try:
             url = f"{ACUMATICA_BASE_URL}{ENTITY_BASE_PATH}/Customer"
             resp = await client.get(url, params={"$top": 1}, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
+        finally:
+            await client.aclose()
         return (
             f"OK: authenticated successfully to {ACUMATICA_BASE_URL} "
             f"(API version {ACUMATICA_API_VERSION}, company "
@@ -916,4 +936,17 @@ if __name__ == "__main__":
     # a hyphen ("streamable-http"), not an underscore.
     mcp.settings.host = "0.0.0.0"
     mcp.settings.port = int(os.environ.get("PORT", 8000))
+    # Disable DNS-rebinding Host-header protection: the SDK auto-enables it
+    # using an allowed_hosts list of 127.0.0.1/localhost ONLY, captured at
+    # FastMCP() construction time (before mcp.settings.host is set to
+    # 0.0.0.0 above) — so Render's real public Host header gets rejected
+    # with a 421 "Invalid Host header" the moment a client (Claude) tries to
+    # register this connector. Safe to disable here: this server has no
+    # browser-facing session/cookie state for DNS rebinding to exploit —
+    # Acumatica auth is entirely server-side via env vars. (Fixed once
+    # already, 2026-09-22 commit 42bc2b0 — regressed when this file was
+    # edited from a stale local copy on 2026-10-07, now fixed again here.)
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
     mcp.run(transport="streamable-http")
