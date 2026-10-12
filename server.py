@@ -25,7 +25,8 @@ full history):
     on PX.Objects.SO.SOLine + SOOrder, with "Expose via OData" checked
     (done 2026-09-22). GIs exposed this way are served through Acumatica's
     OData endpoint, NOT the contract-based /entity/ endpoint — see
-    ODATA_BASE_PATH below and acumatica_discover_odata_entities().
+    ODATA_BASE_PATH below. Its OData entity-set name is
+    "BackorderDollarUnits" (Acumatica drops the '&').
   - Purchase Orders and Inventory are NOT custom Generic Inquiries — they
     come from Acumatica's native screens (Purchase Orders / Inventory
     Summary), so they're queried through the standard contract-based REST
@@ -71,6 +72,20 @@ returns just field names (tiny payload, no guessing); and a new
 expand=Details fetch server-side, then slices the Details list in Python
 before returning — giving real pagination over PO lines even though
 Acumatica's own OData doesn't support it natively.
+
+CHANGELOG (2026-10-12) — BackorderDollar&Units fix: the 302 -> /Frames/
+Error.aspx on every backorder call was caused by the '&' in the inquiry
+name. Acumatica publishes this inquiry to OData as "BackorderDollarUnits"
+(special characters dropped); asking for "BackorderDollar&Units" is
+redirected to the error page. Confirmed live via the deployed connector on
+2026-10-12: "BackorderDollarUnits" returns rows, KB-PL-ByPeriod keeps working
+at "/odata/<name>" with no company segment. Changes: the backorder tool now
+calls "BackorderDollarUnits"; _odata_get cleans any inquiry title the same
+way Acumatica does (and falls back to the exact title once); the 2026-10-08
+company segment in OData URLs is now opt-in (ACUMATICA_ODATA_INCLUDE_COMPANY)
+instead of the default, because this instance does not use it; redirects
+come back as a clear error listing the URLs tried. No environment variable
+changes are required.
 """
 
 import os
@@ -79,6 +94,7 @@ import json
 import logging
 from typing import Optional, Any
 from enum import Enum
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, Field, ConfigDict
@@ -111,7 +127,7 @@ ACUMATICA_API_VERSION = os.environ.get("ACUMATICA_API_VERSION", "24.200.001")
 #   /odata/<Company>/<InquiryName>
 #   /entity/OData/<InquiryName>
 # Kept configurable since it varies by Acumatica version — verify with
-# acumatica_discover_odata_entities() once credentials are live, and update
+# acumatica_query_odata_inquiry once credentials are live, and update
 # this env var / default if needed.
 ODATA_BASE_PATH = os.environ.get("ACUMATICA_ODATA_BASE_PATH", "/odata")
 
@@ -218,6 +234,8 @@ def _handle_api_error(e: Exception) -> str:
         if status == 429:
             return "Error: Acumatica rate limit exceeded. Wait and retry."
         return f"Error: Acumatica API request failed ({status}). Response: {body_snippet}"
+    if isinstance(e, ODataRedirectError):
+        return f"Error: {e}"
     if isinstance(e, httpx.TimeoutException):
         return "Error: Request to Acumatica timed out. Please retry."
     return f"Error: Unexpected error calling Acumatica: {type(e).__name__}: {e}"
@@ -248,17 +266,87 @@ async def _entity_get(path: str, params: Optional[dict] = None) -> Any:
         await client.aclose()
 
 
-async def _odata_get(path: str, params: Optional[dict] = None) -> Any:
-    """GET against the OData endpoint used for GIs exposed 'via OData'.
+def _url_segment(value: str) -> str:
+    """URL-encode one path segment (not a full URL)."""
+    return quote(value, safe="")
+
+
+# Name of the backorder Generic Inquiry AS ACUMATICA PUBLISHES IT IN OData.
+# The inquiry's title in Acumatica is "BackorderDollar&Units", but Acumatica
+# strips characters like '&' when it builds the OData entity-set name, so the
+# OData name is "BackorderDollarUnits". Confirmed live 2026-10-12: requesting
+# "BackorderDollarUnits" returns data; "BackorderDollar&Units" and
+# "BackorderDollar%26Units" both get an HTTP 302 to /Frames/Error.aspx.
+BACKORDER_GI_ODATA_NAME = "BackorderDollarUnits"
+
+# Opt-in only. Confirmed live 2026-10-12 that this instance serves GIs at
+# "/odata/<InquiryName>" with NO company segment (KB-PL-ByPeriod works that
+# way). Adding "/<Company>/" (the 2026-10-08 change) is not needed and is
+# not the default any more. Set ACUMATICA_ODATA_INCLUDE_COMPANY=true only if
+# Acumatica support ever says this instance needs it.
+ODATA_INCLUDE_COMPANY = os.environ.get("ACUMATICA_ODATA_INCLUDE_COMPANY", "").lower() in (
+    "1", "true", "yes"
+)
+
+
+class ODataRedirectError(RuntimeError):
+    """Acumatica answered an OData request with a redirect (usually 302 to
+    /Frames/Error.aspx) instead of data."""
+
+
+def _odata_entity_name(inquiry_name: str) -> str:
+    """Turn a Generic Inquiry title into the entity-set name Acumatica uses
+    in OData: keep letters, digits, '-' and '_'; drop everything else
+    (e.g. '&', spaces). 'BackorderDollar&Units' -> 'BackorderDollarUnits';
+    'KB-PL-ByPeriod' is unchanged."""
+    return "".join(ch for ch in inquiry_name.strip() if ch.isalnum() or ch in "-_")
+
+
+def _odata_url(entity_name: str) -> str:
+    seg = _url_segment(entity_name)
+    if ODATA_INCLUDE_COMPANY and ACUMATICA_COMPANY:
+        return f"{ACUMATICA_BASE_URL}{ODATA_BASE_PATH}/{_url_segment(ACUMATICA_COMPANY)}/{seg}"
+    return f"{ACUMATICA_BASE_URL}{ODATA_BASE_PATH}/{seg}"
+
+
+async def _odata_get(inquiry_name: str, params: Optional[dict] = None) -> Any:
+    """GET a Generic Inquiry exposed 'via OData'.
+
+    FIX (2026-10-12): the inquiry title is converted to Acumatica's OData
+    entity-set name first (special characters dropped — see
+    _odata_entity_name), and the URL is "/odata/<EntitySetName>" with no
+    company segment, which is what this instance serves. If the cleaned-up
+    name differs from what was passed and Acumatica redirects, the name
+    exactly as given is tried once as a fallback. Redirects are never
+    followed; they come back as a clear error naming the URL(s) tried.
+
     See the note on `_entity_get` re: why this doesn't use `async with`.
     """
+    candidates = [_odata_entity_name(inquiry_name)]
+    if inquiry_name.strip() not in candidates:
+        candidates.append(inquiry_name.strip())
     client = await _authed_client()
+    tried = []
     try:
-        url = f"{ACUMATICA_BASE_URL}{ODATA_BASE_PATH}/{path.lstrip('/')}"
-        resp = await client.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        # OData JSON responses often wrap results in a "value" array.
-        return resp.json()
+        for name in candidates:
+            url = _odata_url(name)
+            resp = await client.get(
+                url, params=params or {}, timeout=REQUEST_TIMEOUT, follow_redirects=False
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                tried.append(f"{url} -> HTTP {resp.status_code} to {resp.headers.get('location', '?')}")
+                continue
+            resp.raise_for_status()
+            # OData JSON responses wrap results in a "value" array.
+            return resp.json()
+        raise ODataRedirectError(
+            "Acumatica redirected instead of returning data for every URL tried: "
+            + " | ".join(tried)
+            + ". Check that the Generic Inquiry still has 'Expose via OData' ticked "
+            "(SM208000), that the API user's role can open it, and that the name "
+            "matches the inquiry's OData name (special characters such as '&' are "
+            "dropped by Acumatica)."
+        )
     finally:
         await client.aclose()
 
@@ -383,8 +471,10 @@ class RawODataQueryInput(BaseModel):
 
     inquiry_name: str = Field(
         ...,
-        description="Exact Generic Inquiry title as shown in Acumatica, e.g. "
-        "'BackorderDollar&Units'.",
+        description="Generic Inquiry title as shown in Acumatica, e.g. "
+        "'KB-PL-ByPeriod' or 'BackorderDollar&Units'. Special characters such "
+        "as '&' are dropped automatically to match Acumatica's OData name "
+        "(e.g. 'BackorderDollarUnits').",
         min_length=1,
     )
     filter_odata: Optional[str] = Field(default=None, description="Optional OData $filter.")
@@ -536,14 +626,18 @@ async def acumatica_get_backorder_dollar_units(params: BackorderDollarUnitsInput
         str: JSON array of backorder line objects (or a markdown table if
         response_format="markdown"). Each row is expected to include fields
         such as InventoryID, CustomerID, OpenQty, Amount, UnbilledAmount —
-        exact field names depend on the GI's configured columns; if a field
-        you expect is missing, use acumatica_discover_odata_entities or
-        acumatica_query_odata_inquiry to inspect the raw shape.
+        exact field names depend on the GI's configured columns (live names
+        as of 2026-10-12: OrderType, OrderNbr, Status, Date, CustomerOrderNbr,
+        Customer, CustomerName, InventoryID, LineDescription, UOM, Quantity,
+        QtyOnShipments, OpenQty, UnitPrice, Amount, UnbilledAmount, Completed,
+        LineNbr). Use acumatica_query_odata_inquiry to inspect the raw shape.
 
     Error Handling:
         Returns "Error: ..." with a specific, actionable message on auth
         failure, permission issues, or if the OData endpoint path for this
         GI doesn't match ACUMATICA_ODATA_BASE_PATH's default assumption.
+        Calls the OData entity set "BackorderDollarUnits" (Acumatica drops the
+        '&' from the inquiry title when it publishes it to OData).
     """
     err = _require_config()
     if err:
@@ -552,7 +646,7 @@ async def acumatica_get_backorder_dollar_units(params: BackorderDollarUnitsInput
         params_qs: dict = {"$top": params.top, "$skip": params.skip}
         if params.filter_odata:
             params_qs["$filter"] = params.filter_odata
-        payload = await _odata_get("BackorderDollar&Units", params=params_qs)
+        payload = await _odata_get(BACKORDER_GI_ODATA_NAME, params=params_qs)
         rows = _strip_noise(_rows_from_odata_payload(payload))
         if params.response_format == ResponseFormat.MARKDOWN:
             return _to_markdown_table(rows)
