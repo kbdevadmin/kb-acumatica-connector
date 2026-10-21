@@ -478,7 +478,33 @@ class RawODataQueryInput(BaseModel):
         min_length=1,
     )
     filter_odata: Optional[str] = Field(default=None, description="Optional OData $filter.")
-    top: int = Field(default=500, ge=1, le=10000)
+    top: int = Field(
+        default=500,
+        ge=1,
+        le=10000,
+        description="Max rows to return in this page. Some GIs have very "
+        "verbose rows (many joined/duplicate columns) — if a call overflows "
+        "the tool-output size cap, lower this (try 50-80) rather than "
+        "assuming the GI itself is too large to query.",
+    )
+    skip: int = Field(
+        default=0,
+        ge=0,
+        description="OData $skip — how many matching rows to skip before "
+        "returning `top` more. Page through a large GI's full result set "
+        "with skip=0, then skip=top, skip=2*top, ... until a page returns "
+        "fewer than `top` rows. Added 2026-10-21 after the first version of "
+        "this tool shipped with no way to get past the first page.",
+    )
+    select: Optional[str] = Field(
+        default=None,
+        description="Optional comma-separated list of field names to keep "
+        "in each returned row (e.g. 'InventoryID,WarehouseID,LocationID,"
+        "QtyOnHandinLocation'). Applied client-side after the noise-strip, "
+        "not as an OData $select (GIs don't reliably support that). Narrowing "
+        "this lets more rows fit in one page before hitting the size cap — "
+        "use it together with `top`/`skip` on wide/duplicate-heavy GIs.",
+    )
 
 
 class DiscoverEntityFieldsInput(BaseModel):
@@ -816,15 +842,22 @@ async def acumatica_query_odata_inquiry(params: RawODataQueryInput) -> str:
     """General-purpose, read-only query against any Generic Inquiry that has
     been exposed 'via OData' in Acumatica (Generic Inquiry screen SM208000,
     Interface Options tab). Use this for any future custom report beyond
-    BackorderDollar&Units — for example, if a small custom GI ends up being
-    built for location-level inventory detail.
+    BackorderDollar&Units — for example, location-level inventory detail
+    (DB-StorageDetailsByItemWarehouseLocation).
+
+    Supports real pagination via `skip` (added 2026-10-21): page through a
+    GI's full result set with skip=0, top, 2*top, ... until a page returns
+    fewer rows than `top`. Some GIs (e.g. the storage-details one) have very
+    verbose rows with duplicate/joined columns — if a page still overflows
+    the tool-output size cap, lower `top` and/or pass `select` to keep only
+    the columns you need; don't assume the GI can't be paginated at all.
 
     Args:
         params (RawODataQueryInput): inquiry_name (exact title as shown in
-            Acumatica), filter_odata, top.
+            Acumatica), filter_odata, top, skip, select.
 
     Returns:
-        str: JSON object {"count": int, "rows": [...]}.
+        str: JSON object {"count": int, "skip": int, "rows": [...]}.
 
     Error Handling:
         Returns "Error: ..." — a 404 likely means either the inquiry name is
@@ -835,12 +868,19 @@ async def acumatica_query_odata_inquiry(params: RawODataQueryInput) -> str:
     if err:
         return err
     try:
-        qs: dict = {"$top": params.top}
+        qs: dict = {"$top": params.top, "$skip": params.skip}
         if params.filter_odata:
             qs["$filter"] = params.filter_odata
         payload = await _odata_get(params.inquiry_name, params=qs)
         rows = _strip_noise(_rows_from_odata_payload(payload))
-        return _dumps({"count": len(rows), "rows": rows})
+        if params.select:
+            keep = {f.strip() for f in params.select.split(",") if f.strip()}
+            rows = [
+                {k: v for k, v in row.items() if k in keep}
+                if isinstance(row, dict) else row
+                for row in rows
+            ]
+        return _dumps({"count": len(rows), "skip": params.skip, "rows": rows})
     except Exception as e:  # noqa: BLE001
         return _handle_api_error(e)
 
